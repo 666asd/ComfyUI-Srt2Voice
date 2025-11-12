@@ -8,6 +8,7 @@ import numpy as np
 import tempfile
 from tqdm import tqdm
 from indextts.infer import IndexTTS
+from indextts.infer_v2 import IndexTTS2
 import logging
 
 # 初始化日志
@@ -23,12 +24,11 @@ class Srt2VoiceNode:
     def __init__(self):
         # 初始化TTS模型为None，延迟加载
         self.tts_model = None
+        self.current_model_version = None  # 记录当前加载的模型版本
         # 获取插件根目录（假设nodes.py在插件目录的某个子目录中）
         plugin_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        # 组合模型路径
-        self.model_dir = os.path.join(plugin_root, "models", "IndexTTS-1.5")
-        self.cfg_path = os.path.join(self.model_dir, "config.yaml")
-        logger.info(f"[Srt2Voice] 模型目录: {self.model_dir}")
+        self.plugin_root = plugin_root
+        logger.info(f"[Srt2Voice] 插件根目录: {self.plugin_root}")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -36,6 +36,7 @@ class Srt2VoiceNode:
             "required": {
                 "srt_text": ("STRING", {"multiline": True, "default": "拷贝srt字幕文件内容到这里"}),
                 "reference_audio": ("AUDIO", ),
+                "model_version": (["IndexTTS-1.5", "IndexTTS-2.0"], {"default": "IndexTTS-1.5"}),
             }
         }
 
@@ -46,25 +47,43 @@ class Srt2VoiceNode:
 
     CATEGORY = "audio"
 
-    def _load_tts_model(self):
+    def _load_tts_model(self, model_version):
         """加载TTS模型"""
-        if self.tts_model is not None:
+        # 如果模型已加载且版本相同，则不重复加载
+        if self.tts_model is not None and self.current_model_version == model_version:
             return
             
-        logger.info(f"[Srt2Voice] 正在加载TTS模型...")
+        logger.info(f"[Srt2Voice] 正在加载TTS模型 {model_version}...")
         try:
             # 检查设备
             device = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info(f"[Srt2Voice] 使用设备: {device}")
             
-            # 初始化IndexTTS模型
-            self.tts_model = IndexTTS(
-                cfg_path=self.cfg_path,
-                model_dir=self.model_dir,
-                is_fp16=(device == "cuda"),
-                device=device
-            )
-            logger.info(f"[Srt2Voice] TTS模型加载成功")
+            # 组合模型路径
+            model_dir = os.path.join(self.plugin_root, "models", model_version)
+            cfg_path = os.path.join(model_dir, "config.yaml")
+            logger.info(f"[Srt2Voice] 模型目录: {model_dir}")
+            
+            # 根据版本选择不同的模型类
+            if model_version == "IndexTTS-1.5":
+                self.tts_model = IndexTTS(
+                    cfg_path=cfg_path,
+                    model_dir=model_dir,
+                    use_fp16=(device == "cuda"),
+                    device=device
+                )
+            elif model_version == "IndexTTS-2.0":
+                self.tts_model = IndexTTS2(
+                    cfg_path=cfg_path,
+                    model_dir=model_dir,
+                    use_fp16=(device == "cuda"),
+                    device=device
+                )
+            else:
+                raise ValueError(f"不支持的模型版本: {model_version}")
+            
+            self.current_model_version = model_version
+            logger.info(f"[Srt2Voice] TTS模型 {model_version} 加载成功")
         except Exception as e:
             logger.error(f"[Srt2Voice] 加载TTS模型失败: {e}")
             raise RuntimeError(f"无法加载TTS模型: {e}")
@@ -148,9 +167,9 @@ class Srt2VoiceNode:
             logger.error(f"[Srt2Voice] 调整音频长度失败: {e}")
             raise
 
-    def srt_to_voice(self, srt_text, reference_audio):
+    def srt_to_voice(self, srt_text, reference_audio, model_version):
         # 加载TTS模型
-        self._load_tts_model()
+        self._load_tts_model(model_version)
         
         # 解析SRT文本
         srt_entries = self._parse_srt_text(srt_text)
@@ -173,6 +192,7 @@ class Srt2VoiceNode:
             end = entry['end']
             duration = end - start
             text = entry['text']
+            logger.info(f"[Srt2Voice] 处理字幕 {i+1}/{len(srt_entries)}: '{text}' ({duration:.2f}s)")
             
             # 添加静音段（如果需要）
             if start > current_time:
@@ -183,14 +203,22 @@ class Srt2VoiceNode:
                 current_time += silence_duration
                 logger.info(f"[Srt2Voice] 添加静音: {silence_duration:.2f}s")
             
-            # 合成语音
+            # 合成语音 - 根据模型版本使用不同的参数名称
             temp_path = os.path.join(temp_dir, f"{i:04d}.wav")
-            self.tts_model.infer(
-                audio_prompt=ref_audio_path,
-                text=text,
-                output_path=temp_path,
-                verbose=False
-            )
+            if model_version == "IndexTTS-1.5":
+                self.tts_model.infer(
+                    audio_prompt=ref_audio_path,
+                    text=text,
+                    output_path=temp_path,
+                    verbose=True
+                )
+            elif model_version == "IndexTTS-2.0":
+                self.tts_model.infer(
+                    spk_audio_prompt=ref_audio_path,
+                    text=text,
+                    output_path=temp_path,
+                    verbose=True
+                )
             
             # 调整音频长度以匹配字幕时长
             audio_tensor, _ = self._adjust_audio_length(temp_path, duration, sr)
