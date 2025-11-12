@@ -37,6 +37,9 @@ class Srt2VoiceNode:
                 "srt_text": ("STRING", {"multiline": True, "default": "拷贝srt字幕文件内容到这里"}),
                 "reference_audio": ("AUDIO", ),
                 "model_version": (["IndexTTS-1.5", "IndexTTS-2.0"], {"default": "IndexTTS-1.5"}),
+            },
+            "optional": {
+                "original_audio": ("AUDIO", ),
             }
         }
 
@@ -167,7 +170,67 @@ class Srt2VoiceNode:
             logger.error(f"[Srt2Voice] 调整音频长度失败: {e}")
             raise
 
-    def srt_to_voice(self, srt_text, reference_audio, model_version):
+    def _extract_audio_segment(self, audio_dict, start_time, end_time):
+        """从音频中截取指定时间段并保存为临时文件
+        
+        Args:
+            audio_dict: ComfyUI音频格式 {"waveform": tensor, "sample_rate": int}
+            start_time: 开始时间(秒)
+            end_time: 结束时间(秒)
+            
+        Returns:
+            str: 临时文件路径
+        """
+        try:
+            waveform = audio_dict["waveform"]
+            sample_rate = audio_dict["sample_rate"]
+            
+            # 处理3D张量 [batch, channels, samples] -> [channels, samples]
+            if waveform.dim() == 3:
+                waveform = waveform.squeeze(0)
+            
+            # 处理多声道音频 - 取平均值转为单声道
+            if waveform.dim() == 2 and waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            # 确保最终是2D张量 [channels, samples]
+            if waveform.dim() != 2:
+                waveform = waveform.unsqueeze(0) if waveform.dim() == 1 else waveform
+            
+            # 计算样本索引
+            start_sample = int(start_time * sample_rate)
+            end_sample = int(end_time * sample_rate)
+            
+            # 确保不越界
+            total_samples = waveform.shape[1]
+            start_sample = max(0, min(start_sample, total_samples))
+            end_sample = max(start_sample, min(end_sample, total_samples))
+            
+            # 截取音频段
+            segment = waveform[:, start_sample:end_sample]
+            
+            # 如果截取的段太短,添加静音
+            min_samples = int(0.1 * sample_rate)  # 至少0.1秒
+            if segment.shape[1] < min_samples:
+                padding = min_samples - segment.shape[1]
+                segment = torch.cat([segment, torch.zeros((segment.shape[0], padding))], dim=1)
+                logger.warning(f"[Srt2Voice] 截取的音频段太短,已补充静音到0.1秒")
+            
+            # 创建临时文件
+            temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            temp_path = temp_file.name
+            temp_file.close()
+            
+            # 保存音频段
+            torchaudio.save(temp_path, segment, sample_rate)
+            logger.info(f"[Srt2Voice] 截取音频段 [{start_time:.2f}s - {end_time:.2f}s] 保存到: {temp_path}")
+            
+            return temp_path
+        except Exception as e:
+            logger.error(f"[Srt2Voice] 截取音频段失败: {e}")
+            raise
+
+    def srt_to_voice(self, srt_text, reference_audio, model_version, original_audio=None):
         # 加载TTS模型
         self._load_tts_model(model_version)
         
@@ -182,6 +245,9 @@ class Srt2VoiceNode:
         # 创建临时目录存储中间音频
         temp_dir = tempfile.mkdtemp()
         logger.info(f"[Srt2Voice] 临时目录创建于: {temp_dir}")
+        
+        # 用于存储从原音频截取的情绪音频临时文件
+        emo_temp_files = []
         
         final_audio = []  # 存储所有音频段
         current_time = 0.0  # 当前音频时间位置
@@ -205,6 +271,7 @@ class Srt2VoiceNode:
             
             # 合成语音 - 根据模型版本使用不同的参数名称
             temp_path = os.path.join(temp_dir, f"{i:04d}.wav")
+            
             if model_version == "IndexTTS-1.5":
                 self.tts_model.infer(
                     audio_prompt=ref_audio_path,
@@ -213,10 +280,22 @@ class Srt2VoiceNode:
                     verbose=True
                 )
             elif model_version == "IndexTTS-2.0":
+                # 如果提供了原音频,则从原音频中截取对应时间段作为情绪音频
+                emo_audio_path = None
+                if original_audio is not None:
+                    try:
+                        emo_audio_path = self._extract_audio_segment(original_audio, start, end)
+                        emo_temp_files.append(emo_audio_path)
+                        logger.info(f"[Srt2Voice] 使用原音频截取的情绪音频: {emo_audio_path}")
+                    except Exception as e:
+                        logger.warning(f"[Srt2Voice] 截取原音频失败,将不使用情绪音频: {e}")
+                        emo_audio_path = None
+                
                 self.tts_model.infer(
                     spk_audio_prompt=ref_audio_path,
                     text=text,
                     output_path=temp_path,
+                    emo_audio_prompt=emo_audio_path,
                     verbose=True
                 )
             
@@ -227,11 +306,12 @@ class Srt2VoiceNode:
         
         # 拼接所有音频段
         logger.info(f"[Srt2Voice] 拼接音频段...")
-        combined = torch.cat(final_audio, dim=1)
+        combined = torch.cat(final_audio, dim=1)  # [1, total_samples]
         
-        # 转换为ComfyUI音频格式 [1, 1, samples]
+        # 转换为ComfyUI音频格式 [batch, channels, samples]
+        # combined 已经是 [channels, samples]，只需添加 batch 维度
         audio_output = {
-            "waveform": combined.unsqueeze(0).unsqueeze(0),  # 添加批次和通道维度
+            "waveform": combined.unsqueeze(0),  # [1, 1, samples] - 添加批次维度
             "sample_rate": sr
         }
         
@@ -241,6 +321,10 @@ class Srt2VoiceNode:
                 os.remove(os.path.join(temp_dir, file))
             os.rmdir(temp_dir)
             os.unlink(ref_audio_path)
+            # 清理情绪音频临时文件
+            for emo_file in emo_temp_files:
+                if os.path.exists(emo_file):
+                    os.unlink(emo_file)
             logger.info(f"[Srt2Voice] 临时文件已清理")
         except Exception as e:
             logger.error(f"[Srt2Voice] 清理临时文件时出错: {e}")
