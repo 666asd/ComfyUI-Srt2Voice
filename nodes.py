@@ -364,10 +364,156 @@ class Srt2VoiceNode:
         
         return (audio_output,)
 
+class DualSpeakerSrt2VoiceNode(Srt2VoiceNode):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"multiline": True, "default": "[S1]你好\n[S2]你好呀\n[S1]今天天气不错"}),
+                "reference_audio_1": ("AUDIO", ),
+                "reference_audio_2": ("AUDIO", ),
+                "model_version": (["IndexTTS-1.5", "IndexTTS-2.0"], {"default": "IndexTTS-1.5"}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 2.0, "step": 0.05, "display": "slider"}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.05, "display": "slider"}),
+                "top_k": ("INT", {"default": 30, "min": 1, "max": 100, "step": 1}),
+                "repetition_penalty": ("FLOAT", {"default": 10.0, "min": 1.0, "max": 20.0, "step": 0.5}),
+                "seed": ("INT", {"default": 42, "min": -1, "max": 0xffffffffffffffff}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO", "AUDIO", "AUDIO")
+    RETURN_NAMES = ("merged_audio", "speaker_1_audio", "speaker_2_audio")
+    FUNCTION = "dual_speaker_srt_to_voice"
+    CATEGORY = "audio"
+
+    def dual_speaker_srt_to_voice(self, text, reference_audio_1, reference_audio_2, model_version, temperature, top_p, top_k, repetition_penalty, seed):
+        # 设置随机种子
+        if seed != -1:
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            np.random.seed(seed)
+            import random
+            random.seed(seed)
+            logger.info(f"[Srt2Voice] 设置随机种子: {seed}")
+        
+        # 加载TTS模型
+        self._load_tts_model(model_version)
+        
+        # 保存参考音频
+        ref_audio_path_1 = self._save_temp_audio(reference_audio_1)
+        ref_audio_path_2 = self._save_temp_audio(reference_audio_2)
+        
+        sr = 24000
+        temp_dir = tempfile.mkdtemp()
+        logger.info(f"[Srt2Voice] 临时目录创建于: {temp_dir}")
+        
+        merged_audio = []
+        s1_audio = []
+        s2_audio = []
+        
+        lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
+        
+        for i, line in enumerate(tqdm(lines, desc="合成对话")):
+            speaker = None
+            content = line
+            
+            if line.startswith('[S1]'):
+                speaker = 1
+                content = line[4:].strip()
+            elif line.startswith('[S2]'):
+                speaker = 2
+                content = line[4:].strip()
+            
+            if not speaker or not content:
+                logger.warning(f"[Srt2Voice] 跳过无效行: {line}")
+                continue
+                
+            temp_path = os.path.join(temp_dir, f"{i:04d}.wav")
+            
+            # 动态限制
+            text_length = len(content)
+            if text_length <= 15:
+                max_mel_tokens = min(400, int(text_length * 30))
+            elif text_length <= 30:
+                max_mel_tokens = 600
+            else:
+                max_mel_tokens = 1000
+                
+            generation_kwargs = {
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+                "max_mel_tokens": max_mel_tokens,
+            }
+            
+            ref_audio = ref_audio_path_1 if speaker == 1 else ref_audio_path_2
+            
+            try:
+                if model_version == "IndexTTS-1.5":
+                    self.tts_model.infer(
+                        audio_prompt=ref_audio,
+                        text=content,
+                        output_path=temp_path,
+                        verbose=True,
+                        **generation_kwargs
+                    )
+                elif model_version == "IndexTTS-2.0":
+                    self.tts_model.infer(
+                        spk_audio_prompt=ref_audio,
+                        text=content,
+                        output_path=temp_path,
+                        verbose=True,
+                        **generation_kwargs
+                    )
+                    
+                audio_waveform, audio_sr = torchaudio.load(temp_path)
+                if audio_waveform.shape[0] > 1:
+                    audio_waveform = torch.mean(audio_waveform, dim=0, keepdim=True)
+                    
+                # 添加到列表
+                merged_audio.append(audio_waveform)
+                
+                silence = torch.zeros_like(audio_waveform)
+                
+                if speaker == 1:
+                    s1_audio.append(audio_waveform)
+                    s2_audio.append(silence)
+                else:
+                    s1_audio.append(silence)
+                    s2_audio.append(audio_waveform)
+            except Exception as e:
+                logger.error(f"[Srt2Voice] 合成失败: {e}")
+                continue
+                
+        # 拼接
+        def concat_audio(audio_list):
+            if not audio_list:
+                # 返回1秒静音
+                return {"waveform": torch.zeros((1, 1, 24000)), "sample_rate": sr}
+            combined = torch.cat(audio_list, dim=1)
+            return {"waveform": combined.unsqueeze(0), "sample_rate": sr}
+            
+        result = (concat_audio(merged_audio), concat_audio(s1_audio), concat_audio(s2_audio))
+        
+        # 清理
+        try:
+            for file in os.listdir(temp_dir):
+                os.remove(os.path.join(temp_dir, file))
+            os.rmdir(temp_dir)
+            if os.path.exists(ref_audio_path_1): os.unlink(ref_audio_path_1)
+            if os.path.exists(ref_audio_path_2): os.unlink(ref_audio_path_2)
+        except Exception:
+            pass
+            
+        return result
+
 NODE_CLASS_MAPPINGS = {
     "Srt2VoiceNode": Srt2VoiceNode,
+    "DualSpeakerSrt2VoiceNode": DualSpeakerSrt2VoiceNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Srt2VoiceNode": "SRT to Voice",
+    "DualSpeakerSrt2VoiceNode": "Dual Speaker Text to Audio",
 }
