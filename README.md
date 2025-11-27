@@ -117,3 +117,8 @@ python 3.13 : `..\..\python_embeded\python.exe -m pip install ".\ComfyUI-Srt2Voi
 ---
 
 如需进一步帮助或反馈建议，欢迎提交 Issue！
+
+## ⚠️ 兼容性及测试说明
+
+- 参考 https://github.com/idiap/coqui-ai-TTS/commit/8555c60b21f2665a6f64f9f165153dd62c7639c1 ，该提交为 coqui-ai-TTS 引入了对更高版本 transformers 的支持。
+- 本插件在 transformers 4.56.2 下进行了测试；注意在 IndexTTS-2.0 下生成的声音在某些场景中与参考音频并不完全一致（即“声音和参考声音不一样”），如遇到问题请提交 Issue 并附上复现示例。
