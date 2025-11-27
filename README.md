@@ -9,6 +9,11 @@
 - ⏱️ 自动语速调整以匹配字幕时间  
 - 🌐 支持中英文
 - 🔧 无需编程，直接在 ComfyUI 节点中操作
+ - ⚙️ 兼容 IndexTTS-2.0（除了原有的 IndexTTS-1.5），可以选择不同模型版本进行合成
+ - 💓 支持从“原音频”中自动截取每条字幕对应的“情绪音频段”（仅在 IndexTTS-2.0 时启用），用于提升合成时的情感一致性
+ - 🧩 srt_to_voice 接口支持更多可选推理参数（temperature、top_p、top_k、repetition_penalty、seed 等），用户可在节点中微调合成效果
+ - 🔍 改进的 SRT 解析：优先尝试解析标准 SRT；若解析失败，会退化为“一行一句”的简易解析，提升兼容性
+ - ⏱️ 文本长度自适应生成长度（避免短句生成过长音频），并自动按字幕时间插入静音以对齐时序
 
 ---
 
@@ -74,6 +79,19 @@ python 3.13 : `..\..\python_embeded\python.exe -m pip install ".\ComfyUI-Srt2Voi
 
 - `srt_text`：输入 `.srt` 文件中的字幕内容（纯文本）  
 - `reference_audio`：上传参考音频，用于克隆说话人的音色
+
+可选参数与说明：
+
+- `model_version`：选择 TTS 模型版本（可选：`IndexTTS-1.5` 或 `IndexTTS-2.0`，默认 `IndexTTS-1.5`）。
+- `original_audio`：（可选）上传原始音频文件，只有在使用 `IndexTTS-2.0` 时会尝试按字幕时间自动截取情绪音频段并作为 emo_prompt 提供给模型，从而提升情绪一致性。
+- `temperature` / `top_p` / `top_k` / `repetition_penalty`：推理采样控制参数（节点中可调），用于微调合成风格与多样性。
+- `seed`：随机种子（-1 表示不固定），用于可重复性控制。
+
+行为细节（实现说明）：
+
+- 当提供标准 SRT 文本时，插件会优先解析时间戳并按时序合成；若解析失败会退化为逐行文本处理。
+- 对于短句子，插件会自动限制生成长度（通过动态 max_mel_tokens），避免生成比预期更长的音频片段。
+- 若使用 `IndexTTS-2.0` 且提供 `original_audio`，插件会在每条字幕对应的时段内截取音频片段并传给模型以作为“情绪音频提示（emo_audio_prompt）”。
 
 运行工作流，即可生成对应的语音输出。
 
